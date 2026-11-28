@@ -21,11 +21,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +33,6 @@ import (
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/internal/optional"
-	"github.com/google/uuid"
 	"github.com/googleapis/gax-go/v2/callctx"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
@@ -90,13 +89,14 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		)
 		// Don't error out here. The user may have passed in their own HTTP
 		// client which does not auth with ADC or other common conventions.
-		c, err := internaloption.AuthCreds(ctx, o)
-		if err == nil {
-			creds = c
-			o = append(o, option.WithAuthCredentials(creds))
-		} else if gc, err := transport.Creds(ctx, o...); err == nil {
-			googleCreds = gc
-			o = append(o, option.WithCredentials(googleCreds))
+		if res, rErr := internaloption.NewUnsafeResolver(o...); rErr == nil && !res.ResolvedWithAPIKeyIsCustom() {
+			if c, err := internaloption.AuthCreds(ctx, o); err == nil {
+				creds = c
+				o = append(o, option.WithAuthCredentials(creds))
+			} else if gc, err := transport.Creds(ctx, o...); err == nil {
+				googleCreds = gc
+				o = append(o, option.WithCredentials(googleCreds))
+			}
 		}
 	} else {
 		var hostURL *url.URL
@@ -126,14 +126,22 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 
 	var clientMetrics *clientMetrics
 	var metricsCleanup func()
-	if isOtelMetricsEnabled(&config) {
+	if isOtelMetricsEnabled(&config) || isOtelDebugMetricsEnabled(&config) {
 		var project string
 		if creds != nil {
 			project, _ = creds.ProjectID(ctx)
 		} else if googleCreds != nil {
 			project = googleCreds.ProjectID
 		}
-		clientMetrics, metricsCleanup = initClientMetrics(ctx, project, &config)
+		monSourceOpts := s.clientOption
+		if len(s.monitoringSourceOption) > 0 {
+			monSourceOpts = s.monitoringSourceOption
+		}
+		mOpts, exportOK := monitoringClientOptions(monSourceOpts, creds, googleCreds)
+		if exportOK || config.meterProvider != nil || config.metricExporter != nil {
+			config.monitoringOpts = mOpts
+			clientMetrics, metricsCleanup = initClientMetrics(ctx, project, &config)
+		}
 	}
 	if metricsCleanup != nil {
 		defer func() {
@@ -143,9 +151,19 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		}()
 	}
 
-	if clientMetrics != nil && creds != nil {
-		creds = wrapAuthCredentials(creds, clientMetrics)
-		s.clientOption = append(s.clientOption, option.WithAuthCredentials(creds))
+	if creds != nil {
+		tracingEnabled := isOTelTracingDevEnabled()
+		// Wrap in place: htransport.NewClient in NewClient already holds this
+		// pointer, so its transport must observe the wrapped TokenProvider.
+		if clientMetrics != nil {
+			*creds = *wrapAuthCredentials(creds, clientMetrics)
+		}
+		if tracingEnabled {
+			*creds = *wrapAuthCredentialsForTracing(creds)
+		}
+		if clientMetrics != nil || tracingEnabled {
+			s.clientOption = append(s.clientOption, option.WithAuthCredentials(creds))
+		}
 	}
 
 	// htransport selects the correct endpoint among WithEndpoint (user override), WithDefaultEndpointTemplate, and WithDefaultMTLSEndpoint.
@@ -230,17 +248,37 @@ func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if baseRT == nil {
 		baseRT = http.DefaultTransport
 	}
-	features := t.features | featureAttributes(req.Context())
-	// Merge all existing headers for this key.
-	features |= mergeFeatureAttributes(req.Header.Values(featureTrackerHeaderName))
-	if features > 0 {
-		// Clone the request to avoid modifying the original one.
-		clonedReq := req.Clone(req.Context())
-		clonedReq.Header.Set(featureTrackerHeaderName, encodeUint32(features))
-		return baseRT.RoundTrip(clonedReq)
-	}
+	// Start a Storage.UploadChunk span if req is a resumable upload chunk request.
+	ctx, isChunk := startHTTPUploadChunkSpan(req.Context(), req.Header)
 
-	return baseRT.RoundTrip(req)
+	features := t.features | featureAttributes(ctx)
+	// Merge all existing headers for this key.
+	existing := req.Header.Values(featureTrackerHeaderName)
+	features |= mergeFeatureAttributes(existing)
+	outReq := req
+	if features > 0 || len(existing) > 0 {
+		// This transport owns the feature header: it is always rewritten from the
+		// merged bitmask so that only a single, well-formed value is sent, and it
+		// is removed entirely when there is nothing to report (e.g. a value set on
+		// the context by a caller for an unrelated client must not be forwarded).
+		// Clone the request to avoid modifying the original one.
+		outReq = req.Clone(ctx)
+		if features > 0 {
+			outReq.Header.Set(featureTrackerHeaderName, encodeFeatureMask(features))
+		} else {
+			outReq.Header.Del(featureTrackerHeaderName)
+		}
+	} else if isChunk {
+		outReq = req.WithContext(ctx)
+	}
+	resp, err := baseRT.RoundTrip(outReq)
+	if isChunk {
+		finishSpan(ctx, httpUploadChunkError(resp, err))
+	} else if resp != nil {
+		recordUploadIDFromHeader(ctx, resp.Header)
+	}
+	recordHTTPWritePayload(req, resp)
+	return resp, err
 }
 
 func (t *trackingTransport) CloseIdleConnections() {
@@ -449,7 +487,8 @@ func (c *httpStorageClient) ListObjects(ctx context.Context, bucket string, q *Q
 		ctx, record := startMetricsOp(it.ctx, "ListObjects", true)
 		defer func() { record(err) }()
 		// Add trace span around List API call within the fetch.
-		ctx, _ = startSpan(ctx, "httpStorageClient.ObjectsListCall")
+		// Bucket.Objects has no operation span, so gcp.storage.uri is recorded on each per-page ObjectsListCall span.
+		ctx, _ = startSpan(ctx, "httpStorageClient.ObjectsListCall", withStorageURI(bucket, ""), rpcSystemHTTPOpt)
 		defer func() { endSpan(ctx, err) }()
 		req := c.raw.Objects.List(bucket)
 		if it.query.SoftDeleted {
@@ -896,6 +935,9 @@ func (c *httpStorageClient) ComposeObject(ctx context.Context, req *composeObjec
 	if req.predefinedACL != "" {
 		call.DestinationPredefinedAcl(req.predefinedACL)
 	}
+	if req.dstObject.attrs.KMSKeyName != "" {
+		call.KmsKeyName(req.dstObject.attrs.KMSKeyName)
+	}
 	if err := setEncryptionHeaders(call.Header(), req.dstObject.encryptionKey, false); err != nil {
 		return nil, err
 	}
@@ -972,7 +1014,7 @@ func (c *httpStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 }
 
 func (c *httpStorageClient) NewRangeReader(ctx context.Context, params *newRangeReaderParams, opts ...storageOption) (r *Reader, err error) {
-	ctx, _ = startSpan(ctx, "httpStorageClient.NewRangeReader")
+	ctx, _ = startSpan(ctx, "httpStorageClient.NewRangeReader", rpcSystemHTTPOpt)
 	defer func() { endSpan(ctx, err) }()
 
 	s := callSettings(c.settings, opts...)
@@ -984,7 +1026,6 @@ func (c *httpStorageClient) NewRangeReader(ctx context.Context, params *newRange
 }
 
 func (c *httpStorageClient) newRangeReaderXML(ctx context.Context, params *newRangeReaderParams, s *settings) (r *Reader, err error) {
-	requestID := uuid.New()
 	u := &url.URL{
 		Scheme:  c.scheme,
 		Host:    c.xmlHost,
@@ -1008,51 +1049,35 @@ func (c *httpStorageClient) newRangeReaderXML(ctx context.Context, params *newRa
 		return nil, err
 	}
 
+	// req is reused across retry attempts and setHeadersFromCtx merges
+	// x-goog-api-client values into the existing header. Snapshot the value
+	// set before any attempt and restore it on each attempt so tokens from
+	// earlier attempts (e.g. gccl-attempt-count/1) do not leak into later ones.
+	baseXGoogHeader := slices.Clone(req.Header.Values(xGoogHeaderKey))
+
 	reopen := readerReopen(ctx, req.Header, params, s,
 		func(ctx context.Context) (*http.Response, error) {
+			req.Header.Del(xGoogHeaderKey)
+			for _, v := range baseXGoogHeader {
+				req.Header.Add(xGoogHeaderKey, v)
+			}
 			setHeadersFromCtx(ctx, req.Header)
 
 			if c.dynamicReadReqStallTimeout == nil {
 				return c.hc.Do(req.WithContext(ctx))
 			}
 
-			cancelCtx, cancel := context.WithCancel(ctx)
-			var (
-				res *http.Response
-				err error
-			)
-
-			done := make(chan bool)
-			go func() {
-				reqStartTime := time.Now()
-				res, err = c.hc.Do(req.WithContext(cancelCtx))
-				if err == nil {
-					reqLatency := time.Since(reqStartTime)
-					c.dynamicReadReqStallTimeout.update(params.bucket, reqLatency)
-				} else if errors.Is(err, context.Canceled) {
-					// context.Canceled means operation took more than current dynamicTimeout,
-					// hence should be increased.
-					c.dynamicReadReqStallTimeout.increase(params.bucket)
-				}
-				done <- true
-			}()
-
-			// Wait until stall timeout or request is successful.
-			stallTimeout := c.dynamicReadReqStallTimeout.getValue(params.bucket)
-			timer := time.After(stallTimeout)
-			select {
-			case <-timer:
-				log.Printf("[%s] stalled read-req cancelled after %fs", requestID, stallTimeout.Seconds())
+			var res *http.Response
+			err := executeWithReadStallTimeout(ctx, c.dynamicReadReqStallTimeout, params.bucket, func(ctx context.Context) error {
+				var err error
+				res, err = c.hc.Do(req.WithContext(ctx))
+				return err
+			}, func(stallTimeout time.Duration) {
 				c.metrics.recordStallDuration(ctx, stallTimeout, "ReadObject", "http", stripPort(req.URL.Host))
-				cancel()
-				<-done
 				if res != nil && res.Body != nil {
 					res.Body.Close()
 				}
-				return res, context.DeadlineExceeded
-			case <-done:
-				cancel = nil
-			}
+			})
 			return res, err
 		},
 		func() error { return setConditionsHeaders(req.Header, params.conds) },
@@ -1108,7 +1133,7 @@ func (hiw *httpInternalWriter) validateChecksumFromServer() error {
 	// Do not check for channel closure as error is already set on the writer
 	// if serverChecksumChan is closed without checksum
 	if ok && hiw.fullObjectChecksum != serverChecksum {
-		return fmt.Errorf("storage: object checksum mismatch: computed %q, server %q; the bucket may contain corrupted object", encodeUint32(hiw.fullObjectChecksum), encodeUint32(serverChecksum))
+		return fmt.Errorf("%w: computed %q, server %q; the bucket may contain corrupted object", errChecksumMismatch, encodeUint32(hiw.fullObjectChecksum), encodeUint32(serverChecksum))
 	}
 	return nil
 }
@@ -1181,10 +1206,12 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		if attrs.MD5 != nil {
 			rawObj.Md5Hash = base64.StdEncoding.EncodeToString(attrs.MD5)
 		}
+		// Attach the aligned chunk size so trackingTransport can record Storage.UploadChunk spans.
+		uploadCtx := withUploadChunkSize(params.ctx, params.chunkSize)
 		call := c.raw.Objects.Insert(params.bucket, rawObj).
 			Media(pr, mediaOpts...).
 			Projection("full").
-			Context(params.ctx).
+			Context(uploadCtx).
 			Name(params.attrs.Name)
 		call.ProgressUpdater(func(n, _ int64) { progress(n) })
 
@@ -1211,31 +1238,46 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 
 			// The internals that perform call.Do automatically retry both the initial
 			// call to set up the upload as well as calls to upload individual chunks
-			// for a resumable upload (as long as the chunk size is non-zero). Hence
-			// there is no need to add retries here.
-
-			// Retry only when the operation is idempotent or the retry policy is RetryAlways.
-			var useRetry bool
-			if (s.retry == nil || s.retry.policy == RetryIdempotent) && s.idempotent {
-				useRetry = true
-			} else if s.retry != nil && s.retry.policy == RetryAlways {
-				useRetry = true
+			// for a resumable upload (as long as the chunk size is non-zero). WithRetry
+			// below replaces these defaults when retries are on or for RetryNever.
+			// Writers without preconditions under RetryIdempotent keep the defaults,
+			// so maxAttempts doesn't limit their chunk retries. Stall retries under
+			// ChunkTransferTimeout skip WithRetry, so maxAttempts and RetryNever
+			// don't apply to them.
+			retry := s.retry
+			if retry == nil {
+				retry = defaultRetry
 			}
-			if useRetry {
-				if s.retry != nil {
-					// Wrap shouldRetry to adapt to the googleapi WithRetry signature.
-					var retryFunc func(error) bool
-					if s.retry.shouldRetry != nil {
-						retryFunc = func(err error) bool {
-							return s.retry.shouldRetry(err, nil)
-						}
+			attempts := 1
+			var maxAttemptsReached bool
+			switch {
+			// Retry only when the operation is idempotent or the retry policy is RetryAlways.
+			case retry.policy == RetryAlways || (retry.policy == RetryIdempotent && s.idempotent):
+				call.WithRetry(retry.backoff, func(err error) bool {
+					if err == nil {
+						// Called after each successful request, so each request gets its own budget.
+						attempts = 1
+						maxAttemptsReached = false
+						return false
 					}
-					call.WithRetry(s.retry.backoff, retryFunc)
-				} else {
-					call.WithRetry(nil, nil)
-				}
+					if retry.maxAttempts != nil && attempts >= *retry.maxAttempts {
+						maxAttemptsReached = true
+						return false
+					}
+					if !retry.runShouldRetry(err, nil) {
+						return false
+					}
+					attempts++
+					return true
+				})
+			case retry.policy == RetryNever:
+				// Without WithRetry, the upload library retries resumable chunks by default.
+				call.WithRetry(nil, func(error) bool { return false })
 			}
 			resp, err = call.Do()
+			if err != nil && maxAttemptsReached {
+				err = fmt.Errorf("storage: retry failed after %d attempts; last error: %w", *retry.maxAttempts, err)
+			}
 		}
 		if err != nil {
 			errorf(err)
@@ -1526,7 +1568,7 @@ func (r *httpReader) Read(p []byte) (int, error) {
 			// anything worth looking at.
 			if r.checkCRC {
 				if r.gotCRC != r.wantCRC {
-					return n, fmt.Errorf("storage: bad CRC on read: got %d, want %d",
+					return n, fmt.Errorf("%w: bad CRC on read: got %d, want %d", errChecksumMismatch,
 						r.gotCRC, r.wantCRC)
 				}
 			}
@@ -1596,6 +1638,7 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 		var res *http.Response
 		err = run(ctx, func(ctx context.Context) error {
 			res, err = doDownload(ctx)
+			recordHTTPReadPayload(ctx, res, start, params.length)
 			if err != nil {
 				return formatObjectErr(err)
 			}
@@ -1628,8 +1671,9 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 			// With "Content-Encoding": "gzip" aka decompressive transcoding, GCS serves
 			// back the whole file regardless of the range count passed in as per:
 			//      https://cloud.google.com/storage/docs/transcoding#range,
-			// thus we have to manually move the body forward by seen bytes.
-			if decompressiveTranscoding(res) && seen > 0 {
+			// thus we have to manually move the body forward by seen bytes when a
+			// full-object (non-206) response is returned.
+			if decompressiveTranscoding(res) && seen > 0 && res.StatusCode != http.StatusPartialContent {
 				_, _ = io.CopyN(io.Discard, res.Body, seen)
 			}
 
@@ -1777,14 +1821,18 @@ func setHeadersFromCtx(ctx context.Context, header http.Header) {
 		// Merge x-goog-api-client values into a single space-separated value.
 		if strings.EqualFold(k, xGoogHeaderKey) {
 			alreadySetValues := header.Values(xGoogHeaderKey)
-			vals = append(vals, alreadySetValues...)
-
-			if len(vals) > 0 {
-				xGoogHeader := vals[0]
-				for _, v := range vals[1:] {
-					xGoogHeader = strings.Join([]string{xGoogHeader, v}, " ")
+			var uniqueVals []string
+			for _, list := range [][]string{vals, alreadySetValues} {
+				for _, v := range list {
+					for _, part := range strings.Fields(v) {
+						if !slices.Contains(uniqueVals, part) {
+							uniqueVals = append(uniqueVals, part)
+						}
+					}
 				}
-				header.Set(k, xGoogHeader)
+			}
+			if len(uniqueVals) > 0 {
+				header.Set(k, strings.Join(uniqueVals, " "))
 			}
 		} else {
 			for _, v := range vals {
